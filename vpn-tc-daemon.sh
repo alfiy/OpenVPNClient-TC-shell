@@ -24,7 +24,9 @@ INTERVAL=3
 # 显式以全局方式声明（避免函数内 declare 导致局部/未绑定问题）
 declare -g -A IP_CLASS_MAP=()    # ip -> "user:classid"
 declare -g -A CLASSID_USED=()    # classid -> 1
-
+declare -g -A LAST_SEEN=()    # ip -> user
+REPAIR_TICK=0
+REPAIR_INTERVAL=5            # 每 5 轮才允许一次 repair
 
 #####################################
 # 工具函数
@@ -157,6 +159,42 @@ init_tc() {
 
     return 0
 }
+
+#####################################
+# 从现有 tc 状态恢复 classid 使用情况
+# 目的：避免 daemon 重启后 classid 冲突
+# 不做任何 add / del / 上下线判断
+#####################################
+rebuild_state() {
+    CLASSID_USED=()
+
+    # VPN_DEV (1:)
+    if tc class show dev "$VPN_DEV" 2>/dev/null | grep -q "htb"; then
+        while read -r line; do
+            if [[ "$line" =~ classid[[:space:]]+1:([0-9]+) ]]; then
+                cid="${BASH_REMATCH[1]}"
+                if (( cid >= CLASSID_START && cid <= CLASSID_END )); then
+                    CLASSID_USED["$cid"]=1
+                fi
+            fi
+        done < <(tc class show dev "$VPN_DEV" 2>/dev/null)
+    fi
+
+    # IFB_DEV (2:) —— 双保险
+    if tc class show dev "$IFB_DEV" 2>/dev/null | grep -q "htb"; then
+        while read -r line; do
+            if [[ "$line" =~ classid[[:space:]]+2:([0-9]+) ]]; then
+                cid="${BASH_REMATCH[1]}"
+                if (( cid >= CLASSID_START && cid <= CLASSID_END )); then
+                    CLASSID_USED["$cid"]=1
+                fi
+            fi
+        done < <(tc class show dev "$IFB_DEV" 2>/dev/null)
+    fi
+
+    log "🔄 rebuild_state: 已恢复 ${#CLASSID_USED[@]} 个已占用 classid"
+}
+
 
 
 #####################################
@@ -361,55 +399,55 @@ log "✅ 服务启动完成，开始监控客户端连接"
 
 
 while true; do
-
     mapfile -t CURRENT < <(parse_clients)
 
-    declare -A SEEN=()
+    declare -A CURRENT_MAP=()
 
+    # ========= 构建当前快照 =========
     for line in "${CURRENT[@]}"; do
-        # 跳过空行
         [[ -z "${line//[[:space:]]/}" ]] && continue
 
-        # 通过空白分隔 user 和 ip；同时去掉可能的 CR (\r)
         user=$(awk '{print $1}' <<<"$line" | tr -d '\r')
         ip=$(awk '{print $2}' <<<"$line" | tr -d '\r')
 
-        # 规范化：去除前后空白以避免不可见字符导致比较失败
-        user=${user##+([[:space:]])}
-        user=${user%%+([[:space:]])}
-        ip=${ip##+([[:space:]])}
-        ip=${ip%%+([[:space:]])}
+        [[ -z "$user" || -z "$ip" ]] && continue
+        CURRENT_MAP["$ip"]="$user"
+    done
 
-        [[ -z "$ip" || -z "$user" ]] && continue
-        [[ -n "${SEEN[$ip]:-}" ]] && continue
-        SEEN["$ip"]=1
+    # ========= 新上线 =========
+    for ip in "${!CURRENT_MAP[@]}"; do
+        user="${CURRENT_MAP[$ip]}"
 
-        if [[ -z "${IP_CLASS_MAP[$ip]:-}" ]]; then
+        if [[ -z "${LAST_SEEN[$ip]:-}" ]]; then
             add_client "$user" "$ip" || true
-        else
-            old_entry="${IP_CLASS_MAP[$ip]:-}"
-            old_user="${old_entry%:*}"
-            
-            if [[ "$old_user" != "$user" && -n "$old_user" ]]; then
-                log "ℹ 检测到 $ip 对应 user 变更: $old_user -> $user，重建 class"
-                del_client "$ip" || true
-                sleep 0.2
-                add_client "$user" "$ip" || true
-            else
+        fi
+    done
+
+    # ========= 下线 =========
+    for ip in "${!LAST_SEEN[@]}"; do
+        if [[ -z "${CURRENT_MAP[$ip]:-}" ]]; then
+            del_client "$ip" || true
+        fi
+    done
+
+    # ========= 稳态修复（降频） =========
+    REPAIR_TICK=$((REPAIR_TICK + 1))
+
+    if (( REPAIR_TICK >= REPAIR_INTERVAL )); then
+        for ip in "${!CURRENT_MAP[@]}"; do
+            user="${CURRENT_MAP[$ip]}"
+            if [[ -n "${IP_CLASS_MAP[$ip]:-}" ]]; then
                 repair_client "$user" "$ip" || true
             fi
-        fi
+        done
+        REPAIR_TICK=0
+    fi
+
+    # ========= 更新快照 =========
+    LAST_SEEN=()
+    for ip in "${!CURRENT_MAP[@]}"; do
+        LAST_SEEN["$ip"]="${CURRENT_MAP[$ip]}"
     done
 
-    # 下线检测：先把当前键复制到数组（避免在遍历时修改关联数组造成遗漏）
-    keys=("${!IP_CLASS_MAP[@]}")
-    for ip in "${keys[@]}"; do
-        # 规范化 ip（以防存储时带有不可见字符）
-        clean_ip=$(tr -d '\r' <<<"$ip")
-        if [[ -z "${SEEN[$clean_ip]:-}" ]]; then
-            del_client "$clean_ip" || true
-        fi
-    done
-
-    sleep "$INTERVAL" || true
+    sleep "$INTERVAL"
 done
