@@ -25,7 +25,6 @@ INTERVAL=3
 declare -g -A IP_CLASS_MAP=()    # ip -> "user:classid"
 declare -g -A CLASSID_USED=()    # classid -> 1
 
-REBUILD_COUNTER=0
 
 #####################################
 # 工具函数
@@ -57,6 +56,7 @@ get_user_rate() {
 
     echo "${DEFAULT_UP} ${DEFAULT_DOWN}"
 }
+
 
 #####################################
 # 辅助：检查 tc class/filter 存在性（用于幂等）
@@ -158,87 +158,6 @@ init_tc() {
     return 0
 }
 
-#####################################
-# 恢复/重建脚本内存状态（幂等）
-#####################################
-rebuild_state() {
-    log "🔁 尝试从 kernel tc 状态恢复映射（rebuild_state）"
-    ((REBUILD_COUNTER++))
-
-    # 临时关联数组（局部）
-    declare -A tmp_map=()
-    declare -A status_map=()
-
-    # 扫描 VPN_DEV 上的 filter（寻找 dst_ip）
-    if tc filter show dev "$VPN_DEV" parent 1: 2>/dev/null | grep -q .; then
-        while IFS= read -r line; do
-            if [[ "$line" =~ dst_ip[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                ip="${BASH_REMATCH[1]}"
-                cid=""
-                if [[ "$line" =~ flowid[[:space:]]+1:([0-9]+) ]]; then
-                    cid="${BASH_REMATCH[1]}"
-                else
-                    read -r nextline || true
-                    if [[ "$nextline" =~ flowid[[:space:]]+1:([0-9]+) ]]; then
-                        cid="${BASH_REMATCH[1]}"
-                    fi
-                fi
-                if [[ -n "$cid" ]]; then
-                    tmp_map["$ip"]="$cid"
-                    CLASSID_USED[$cid]=1
-                fi
-            fi
-        done < <(tc filter show dev "$VPN_DEV" parent 1: 2>/dev/null || true)
-    fi
-
-    # 扫描 IFB_DEV 上的 filter（寻找 src_ip）
-    if tc filter show dev "$IFB_DEV" parent 2: 2>/dev/null | grep -q .; then
-        while IFS= read -r line; do
-            if [[ "$line" =~ src_ip[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                ip="${BASH_REMATCH[1]}"
-                cid=""
-                if [[ "$line" =~ flowid[[:space:]]+2:([0-9]+) ]]; then
-                    cid="${BASH_REMATCH[1]}"
-                else
-                    read -r nextline || true
-                    if [[ "$nextline" =~ flowid[[:space:]]+2:([0-9]+) ]]; then
-                        cid="${BASH_REMATCH[1]}"
-                    fi
-                fi
-                if [[ -n "$cid" ]]; then
-                    tmp_map["$ip"]="$cid"
-                    CLASSID_USED[$cid]=1
-                fi
-            fi
-        done < <(tc filter show dev "$IFB_DEV" parent 2: 2>/dev/null || true)
-    fi
-
-    # 尝试从 status.log 中获取 user -> ip 映射，用于恢复 IP_CLASS_MAP 的 user 字段
-    if [[ -f "$STATUS_LOG" ]]; then
-        while IFS= read -r line; do
-            ip=$(awk -F, '{print $1}' <<<"$line" | tr -d '[:space:]')
-            user=$(awk -F, '{print $2}' <<<"$line" | tr -d '[:space:]')
-            if [[ -n "$ip" && -n "$user" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                status_map["$ip"]="$user"
-            fi
-        done < <(awk -F, '/^ROUTING TABLE/{in=1;next}/^GLOBAL STATS/{in=0} in && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {print $0}' "$STATUS_LOG" 2>/dev/null || true)
-    fi
-
-    # 合并 tmp_map -> IP_CLASS_MAP（含 user 若可得）
-    for ip in "${!tmp_map[@]}"; do
-        cid="${tmp_map[$ip]}"
-        user="${status_map[$ip]:-}"
-        if [[ -n "$user" ]]; then
-            IP_CLASS_MAP["$ip"]="$user:$cid"
-        else
-            IP_CLASS_MAP["$ip"]=":$cid"
-        fi
-        CLASSID_USED[$cid]=1
-    done
-
-    log "🔁 rebuild_state 完成: 恢复 ${#tmp_map[@]} 条映射，已标记 ${#CLASSID_USED[@]} 个 classid 为已用"
-    return 0
-}
 
 #####################################
 # classid 分配（基于 CLASSID_USED）
@@ -380,6 +299,43 @@ parse_clients() {
     ' "$STATUS_LOG" 2>/dev/null || true
 }
 
+
+repair_client() {
+    local user="$1"
+    local ip="$2"
+    local entry="${IP_CLASS_MAP[$ip]}"
+
+    local classid="${entry##*:}"
+    read RATE_UP RATE_DOWN <<< "$(get_user_rate "$user")"
+
+    local repaired=0
+
+    if ! class_exists "$VPN_DEV" "1:" "$classid"; then
+        tc class add dev "$VPN_DEV" parent 1:1 classid 1:$classid htb rate "$RATE_UP" ceil "$RATE_UP" || true
+        repaired=1
+    fi
+
+    if ! filter_exists_dst "$VPN_DEV" "1:" "$ip"; then
+        tc filter add dev "$VPN_DEV" protocol ip parent 1: prio "$classid" flower dst_ip "$ip" flowid 1:$classid || true
+        repaired=1
+    fi
+
+    if ! class_exists "$IFB_DEV" "2:" "$classid"; then
+        tc class add dev "$IFB_DEV" parent 2:1 classid 2:$classid htb rate "$RATE_DOWN" ceil "$RATE_DOWN" || true
+        repaired=1
+    fi
+
+    if ! filter_exists_src "$IFB_DEV" "2:" "$ip"; then
+        tc filter add dev "$IFB_DEV" protocol ip parent 2: prio "$classid" flower src_ip "$ip" flowid 2:$classid || true
+        repaired=1
+    fi
+
+    if [[ "$repaired" -eq 1 ]]; then
+        log "🛠 修复 tc 规则: $user ($ip) class=$classid"
+    fi
+}
+
+
 #####################################
 # 主循环
 #####################################
@@ -403,7 +359,9 @@ done
 
 log "✅ 服务启动完成，开始监控客户端连接"
 
+
 while true; do
+
     mapfile -t CURRENT < <(parse_clients)
 
     declare -A SEEN=()
@@ -431,17 +389,14 @@ while true; do
         else
             old_entry="${IP_CLASS_MAP[$ip]:-}"
             old_user="${old_entry%:*}"
+            
             if [[ "$old_user" != "$user" && -n "$old_user" ]]; then
                 log "ℹ 检测到 $ip 对应 user 变更: $old_user -> $user，重建 class"
                 del_client "$ip" || true
                 sleep 0.2
                 add_client "$user" "$ip" || true
             else
-                # 如果重建时 user 为空，更新
-                old_cid="${old_entry##*:}"
-                if [[ "$old_user" == "" && "${IP_CLASS_MAP[$ip]:-}" != "$user:$old_cid" ]]; then
-                    IP_CLASS_MAP["$ip"]="$user:$old_cid"
-                fi
+                repair_client "$user" "$ip" || true
             fi
         fi
     done
