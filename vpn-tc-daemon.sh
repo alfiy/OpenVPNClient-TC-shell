@@ -73,25 +73,25 @@ class_exists() {
     return 1
 }
 
-filter_exists_dst() { # for VPN_DEV egress (dst_ip)
-    local dev="$1"
-    local parent="$2"
-    local ip="$3"
-    if tc filter show dev "$dev" parent "$parent" 2>/dev/null | grep -qE "dst_ip[[:space:]]+${ip}(/32)?"; then
+filter_exists_dst() {
+    local dev="$1" parent="$2" ip="$3"
+
+    if tc filter show dev "$dev" parent "$parent" 2>/dev/null | grep -qw "dst_ip $ip"; then
         return 0
     fi
     return 1
 }
 
-filter_exists_src() { # for IFB_DEV (src_ip)
+filter_exists_src() {
     local dev="$1"
     local parent="$2"
     local ip="$3"
-    if tc filter show dev "$dev" parent "$parent" 2>/dev/null | grep -qE "src_ip[[:space:]]+${ip}(/32)?"; then
+    if tc filter show dev "$dev" parent "$parent" 2>/dev/null | grep -qw "src_ip $ip"; then
         return 0
     fi
     return 1
 }
+
 
 #####################################
 # TC 初始化（尽量幂等）
@@ -338,40 +338,118 @@ parse_clients() {
 }
 
 
+
+#####################################
+# 自愈函数功能
+#####################################
+
+# 检查设备是否存在根 qdisc
+root_qdisc_exists() {
+    local dev="$1"
+    local handle="${2:-1}"  # 默认 root handle 1
+    tc qdisc show dev "$dev" | grep -q "htb ${handle}:"
+}
+
+# 检查设备是否存在指定 class 的父类
+parent_class_exists() {
+    local dev="$1"
+    local parent="$2"   # 1:1 or 2:1
+    tc class show dev "$dev" | grep -q "class htb $parent"
+}
+
+# 确保 root+parent 存在(repair_client 前置检查)
+ensure_tc_base() {
+    local dev="$1"
+    local parent="$2"   # 1:1 or 2:1
+    local root_handle="${parent%%:*}"  # 提取父类号作为 root handle
+
+    if ! root_qdisc_exists "$dev" "$root_handle"; then
+        log "⚠️  $dev root qdisc 不存在，repair_client 放弃"
+        return 1
+    fi
+
+    if ! parent_class_exists "$dev" "$parent"; then
+        log "⚠️  $dev parent $parent 不存在，repair_client 放弃"
+        return 1
+    fi
+
+    return 0
+}
+
+
+
+# 自愈函数
 repair_client() {
     local user="$1"
     local ip="$2"
-    local entry="${IP_CLASS_MAP[$ip]}"
 
+    # 必须有内存映射
+    if [[ -z "${IP_CLASS_MAP[$ip]:-}" ]]; then
+        log "⚠️ repair_client: $ip 无 IP_CLASS_MAP 记录，跳过"
+        return
+    fi
+
+    local entry="${IP_CLASS_MAP[$ip]}"
     local classid="${entry##*:}"
+
     read RATE_UP RATE_DOWN <<< "$(get_user_rate "$user")"
 
     local repaired=0
 
+    # === 0️⃣ 基础结构校验（致命） ===
+    ensure_tc_base "$VPN_DEV" "1:1" || return
+    ensure_tc_base "$IFB_DEV" "2:1" || return
+
+    # === 1️⃣ uplink class ===
     if ! class_exists "$VPN_DEV" "1:" "$classid"; then
-        tc class add dev "$VPN_DEV" parent 1:1 classid 1:$classid htb rate "$RATE_UP" ceil "$RATE_UP" || true
-        repaired=1
+        if tc class add dev "$VPN_DEV" parent 1:1 classid 1:$classid htb \
+            rate "$RATE_UP" ceil "$RATE_UP" 2>/dev/null; then
+            log "🛠 创建 tun0 class 1:$classid"
+            repaired=1
+        else
+            log "❌ 创建 tun0 class 1:$classid 失败"
+            return
+        fi
     fi
 
+    # === 2️⃣ uplink filter ===
     if ! filter_exists_dst "$VPN_DEV" "1:" "$ip"; then
-        tc filter add dev "$VPN_DEV" protocol ip parent 1: prio "$classid" flower dst_ip "$ip" flowid 1:$classid || true
-        repaired=1
+        if tc filter add dev "$VPN_DEV" protocol ip parent 1: \
+            prio "$classid" flower dst_ip "$ip" flowid 1:$classid 2>/dev/null; then
+            repaired=1
+        else
+            log "❌ 添加 tun0 filter dst_ip=$ip 失败"
+            return
+        fi
     fi
 
+    # === 3️⃣ downlink class ===
     if ! class_exists "$IFB_DEV" "2:" "$classid"; then
-        tc class add dev "$IFB_DEV" parent 2:1 classid 2:$classid htb rate "$RATE_DOWN" ceil "$RATE_DOWN" || true
-        repaired=1
+        if tc class add dev "$IFB_DEV" parent 2:1 classid 2:$classid htb \
+            rate "$RATE_DOWN" ceil "$RATE_DOWN" 2>/dev/null; then
+            repaired=1
+        else
+            log "❌ 创建 ifb0 class 2:$classid 失败"
+            return
+        fi
     fi
 
+    # === 4️⃣ downlink filter ===
     if ! filter_exists_src "$IFB_DEV" "2:" "$ip"; then
-        tc filter add dev "$IFB_DEV" protocol ip parent 2: prio "$classid" flower src_ip "$ip" flowid 2:$classid || true
-        repaired=1
+        if tc filter add dev "$IFB_DEV" protocol ip parent 2: \
+            prio "$classid" flower src_ip "$ip" flowid 2:$classid 2>/dev/null; then
+            repaired=1
+        else
+            log "❌ 添加 ifb0 filter src_ip=$ip 失败"
+            return
+        fi
     fi
 
-    if [[ "$repaired" -eq 1 ]]; then
+    if (( repaired == 1 )); then
         log "🛠 修复 tc 规则: $user ($ip) class=$classid"
     fi
 }
+
 
 
 #####################################
