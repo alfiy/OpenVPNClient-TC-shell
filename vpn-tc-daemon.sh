@@ -76,7 +76,7 @@ class_exists() {
 filter_exists_dst() {
     local dev="$1" parent="$2" ip="$3"
 
-    if tc filter show dev "$dev" parent "$parent" 2>/dev/null | grep -qw "dst_ip $ip"; then
+    if tc filter show dev "$dev" parent "$parent" 2>/dev/null | grep -qF "dst_ip $ip"; then
         return 0
     fi
     return 1
@@ -86,7 +86,7 @@ filter_exists_src() {
     local dev="$1"
     local parent="$2"
     local ip="$3"
-    if tc filter show dev "$dev" parent "$parent" 2>/dev/null | grep -qw "src_ip $ip"; then
+    if tc filter show dev "$dev" parent "$parent" 2>/dev/null | grep -qF "src_ip $ip"; then
         return 0
     fi
     return 1
@@ -239,26 +239,18 @@ add_client() {
 
     if ! class_exists "$VPN_DEV" "1:" "$cid"; then
         tc class add dev "$VPN_DEV" parent 1:1 classid 1:$cid htb rate "$RATE_UP" ceil "$RATE_UP" 2>/dev/null || true
-    else
-        log "ℹ class 1:$cid 已存在（$VPN_DEV）"
     fi
 
     if ! filter_exists_dst "$VPN_DEV" "1:" "$ip"; then
         tc filter add dev "$VPN_DEV" protocol ip parent 1: prio "$cid" flower dst_ip "$ip" flowid 1:$cid 2>/dev/null || true
-    else
-        log "ℹ filter (dst $ip) 已存在于 $VPN_DEV"
     fi
 
     if ! class_exists "$IFB_DEV" "2:" "$cid"; then
         tc class add dev "$IFB_DEV" parent 2:1 classid 2:$cid htb rate "$RATE_DOWN" ceil "$RATE_DOWN" 2>/dev/null || true
-    else
-        log "ℹ class 2:$cid 已存在（$IFB_DEV）"
     fi
 
     if ! filter_exists_src "$IFB_DEV" "2:" "$ip"; then
         tc filter add dev "$IFB_DEV" protocol ip parent 2: prio "$cid" flower src_ip "$ip" flowid 2:$cid 2>/dev/null || true
-    else
-        log "ℹ filter (src $ip) 已存在于 $IFB_DEV"
     fi
 
     IP_CLASS_MAP["$ip"]="$user:$cid"
@@ -288,14 +280,10 @@ del_client() {
 
     if filter_exists_dst "$VPN_DEV" "1:" "$ip"; then
         tc filter del dev "$VPN_DEV" parent 1: protocol ip prio "$classid" flower dst_ip "$ip" 2>/dev/null || true
-    else
-        log "ℹ $VPN_DEV 上无 dst filter $ip"
     fi
 
     if filter_exists_src "$IFB_DEV" "2:" "$ip"; then
         tc filter del dev "$IFB_DEV" parent 2: protocol ip prio "$classid" flower src_ip "$ip" 2>/dev/null || true
-    else
-        log "ℹ $IFB_DEV 上无 src filter $ip"
     fi
 
     if class_exists "$VPN_DEV" "1:" "$classid"; then
