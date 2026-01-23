@@ -514,6 +514,10 @@ while true; do
     for ip in "${!CURRENT_MAP[@]}"; do
         LAST_SEEN["$ip"]="${CURRENT_MAP[$ip]}"
     done
+    # ========= systemd watchdog 心跳 =========
+    if [[ -n "${WATCHDOG_USEC:-}" ]] && command -v systemd-notify >/dev/null 2>&1; then
+        systemd-notify --status="监控中: ${#CURRENT_MAP[@]} 个客户端在线" WATCHDOG=1
+    fi
 
     sleep "$INTERVAL"
 done

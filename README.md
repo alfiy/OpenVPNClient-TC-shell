@@ -102,3 +102,15 @@ OpenVPN 需开启 status 日志（配置文件中加 status /var/log/openvpn/sta
 4. 资源的回收与复用
 该限制仅针对同时在线的用户数。当客户端下线时，脚本通过 del_client 过程调用 free_classid，将该 ID 从 CLASSID_USED 中移除，从而使其能够被后续上线的其他用户重新利用。
 总结： 该脚本目前最大支持 250 个并发用户 的带宽管理。如果您的 OpenVPN 服务器需要支持更多同时在线的用户，需要手动修改脚本开头的 CLASSID_END 参数以扩大资源池。
+
+## 创建systemd服务
+
+将vpn-tc-daemon.service文件保存在/etc/systemd/system目录下，然后执行以下命令：
+
+```bash
+systemctl daemon-reload
+systemctl enable vpn-tc-daemon.service
+systemctl start vpn-tc-daemon.service
+```
+
+
